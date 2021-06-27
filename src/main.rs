@@ -1,11 +1,14 @@
+use std::ops::Deref;
 use std::sync::Arc;
 
 use vulkano::buffer::{BufferUsage, CpuAccessibleBuffer};
 use vulkano::command_buffer::{AutoCommandBufferBuilder, CommandBufferUsage, DynamicState, SubpassContents};
+use vulkano::descriptor::pipeline_layout::PipelineLayoutDesc;
 use vulkano::device::Device;
 use vulkano::device::DeviceExtensions;
 use vulkano::device::Features;
 use vulkano::image::{ImageUsage, SwapchainImage};
+use vulkano::image::view::ImageView;
 use vulkano::instance::Instance;
 use vulkano::instance::InstanceExtensions;
 use vulkano::instance::PhysicalDevice;
@@ -13,12 +16,12 @@ use vulkano::pipeline::GraphicsPipeline;
 use vulkano::pipeline::viewport::Viewport;
 use vulkano::render_pass::{Framebuffer, FramebufferAbstract, RenderPass, Subpass};
 use vulkano::swapchain::{AcquireError, ColorSpace, FullscreenExclusive, PresentMode, SurfaceTransform, Swapchain, SwapchainCreationError};
+use vulkano::sync;
+use vulkano::sync::{FlushError, GpuFuture};
 use vulkano_win::VkSurfaceBuild;
 use winit::event::{Event, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoop};
 use winit::window::{Window, WindowBuilder};
-use std::ops::Deref;
-use vulkano::image::view::ImageView;
 
 fn main() {
     let instance = {
@@ -30,47 +33,39 @@ fn main() {
 
     let physical = PhysicalDevice::enumerate(&instance).next().expect("no device available");
 
-    let queue_family = physical.queue_families().find(|&q| q.supports_graphics()).expect("couldn't find a graphical queue family");
+    let events_loop = EventLoop::new();
+    let surface = WindowBuilder::new()
+        .build_vk_surface(&events_loop, instance.clone())
+        .unwrap();
+
+    let queue_family = physical.queue_families()
+                               .find(|&q| {
+                                   q.supports_graphics() && surface.is_supported(q).unwrap_or(false)
+                               })
+                               .expect("couldn't find a graphical queue family");
+
+    let device_ext = vulkano::device::DeviceExtensions {
+        khr_swapchain: true,
+        ..vulkano::device::DeviceExtensions::none()
+    };
 
     let (device, mut queues) = {
-        let device_ext = vulkano::device::DeviceExtensions {
-            khr_swapchain: true,
-            ..vulkano::device::DeviceExtensions::none()
-        };
-        Device::new(physical, &Features::none(), &device_ext, [(queue_family, 0.5)].iter().cloned()).expect("failed device creation")
+        Device::new(physical, &Features::none(), &device_ext, [(queue_family, 0.5)].iter().cloned())
+            .expect("failed device creation")
     };
 
     let queue = queues.next().unwrap();
 
-    let events_loop = EventLoop::new();
-    let surface = WindowBuilder::new().build_vk_surface(&events_loop, instance.clone()).unwrap();
-
-    let caps = surface.capabilities(physical)
-                      .expect("failed to get surface capabilities");
-
-    let dimensions = caps.current_extent.unwrap_or([1280, 1024]);
-    let alpha = caps.supported_composite_alpha.iter().next().unwrap();
-    let format = caps.supported_formats[0].0;
-    let mut recreate_swapchain = false;
-
-    // let (swapchain, images) = Swapchain::start(device.clone(), surface.clone())
-    //     .num_images(caps.min_image_count)
-    //     .format(format)
-    //     .dimensions(dimensions)
-    //     .usage(ImageUsage::color_attachment())
-    //     .sharing_mode(&queue)
-    //     .composite_alpha(alpha)
-    //     .transform(SurfaceTransform::Identity)
-    //     .present_mode(PresentMode::Fifo)
-    //     .fullscreen_exclusive(FullscreenExclusive::Default)
-    //     .color_space(ColorSpace::SrgbNonLinear)
-    //     .build()
-    //     .unwrap();
-
     // params missing from guide: 1 + true
-    let (swapchain, image_views) = {
+    let (mut swapchain, image_views) = {
+        let capabilities = surface.capabilities(physical).expect("failed to get surface capabilities");
+
+        let dimensions = capabilities.current_extent.unwrap_or([1280, 1024]);
+        let alpha = capabilities.supported_composite_alpha.iter().next().unwrap();
+        let format = capabilities.supported_formats[0].0;
+
         let (swapchain, images) = Swapchain::start(device.clone(), surface.clone())
-            .num_images(caps.min_image_count)
+            .num_images(capabilities.min_image_count)
             .format(format)
             .dimensions(dimensions)
             .usage(ImageUsage::color_attachment())
@@ -85,20 +80,6 @@ fn main() {
         let images: Vec<_> = images.into_iter().map(|img| ImageView::new(img).unwrap()).collect();
         (swapchain, images)
     };
-
-    let (image_num, suboptimal, acquire_future) =
-        match vulkano::swapchain::acquire_next_image(swapchain.clone(), None) {
-            Ok(r) => r,
-            Err(AcquireError::OutOfDate) => {
-                recreate_swapchain = true;
-                return;
-            }
-            Err(e) => panic!("Failed to acquire next image: {:?}", e),
-        };
-
-    if suboptimal {
-        recreate_swapchain = true;
-    }
 
     let vertex_buffer = {
         #[derive(Default, Debug, Clone)]
@@ -127,8 +108,6 @@ fn main() {
         )
             .unwrap()
     };
-
-    let clear_values = vec![[0.0, 0.0, 1.0, 1.0].into()];
 
     mod vs {
         vulkano_shaders::shader! {
@@ -226,25 +205,104 @@ fn main() {
     let mut framebuffers =
         window_size_dependent_setup(&image_views, render_pass.clone(), &mut dynamic_state);
 
-    let mut builder = vulkano::command_buffer::AutoCommandBufferBuilder::primary(device.clone(), queue_family, CommandBufferUsage::OneTimeSubmit)
-        .unwrap();
+    let mut recreate_swapchain = false;
 
-    let x = builder
-        //begin render pass?
-        .begin_render_pass(framebuffers[image_num].clone(), SubpassContents::Inline, clear_values)
-        .unwrap()
-        .draw(pipeline.clone(), &dynamic_state, vertex_buffer.clone(), (), (), vec![])
-        .unwrap()
-        .end_render_pass()
-        .unwrap();
+    let mut previous_frame_end = Some(sync::now(device.clone()).boxed());
 
-    // let command_buffer = builder.bui
-
-
-    events_loop.run(|event, _, control_flow| {
+    events_loop.run(move |event, _, control_flow| {
         match event {
             Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => {
                 *control_flow = ControlFlow::Exit;
+            }
+            Event::WindowEvent { event: WindowEvent::Resized(_), .. } => {
+                recreate_swapchain = true;
+            }
+            Event::RedrawEventsCleared => {
+                previous_frame_end.as_mut().unwrap().cleanup_finished();
+
+                // Whenever the window resizes we need to recreate everything dependent on the window size.
+                // In this example that includes the swapchain, the framebuffers and the dynamic state viewport.
+                if recreate_swapchain {
+                    // Get the new dimensions of the window.
+                    let dimensions: [u32; 2] = surface.window().inner_size().into();
+                    let (new_swapchain, new_image_views) =
+                        match swapchain.recreate().dimensions(dimensions).build() {
+                            Ok((new_swapchain, new_images)) => {
+                                let new_image_views: Vec<_> = new_images.into_iter().map(|img| ImageView::new(img).unwrap()).collect();
+                                (new_swapchain, new_image_views)
+                            }
+                            // This error tends to happen when the user is manually resizing the window.
+                            // Simply restarting the loop is the easiest way to fix this issue.
+                            Err(SwapchainCreationError::UnsupportedDimensions) => return,
+                            Err(e) => panic!("Failed to recreate swapchain: {:?}", e),
+                        };
+
+                    swapchain = new_swapchain;
+                    // Because framebuffers contains an Arc on the old swapchain, we need to
+                    // recreate framebuffers as well.
+                    framebuffers = window_size_dependent_setup(
+                        &new_image_views,
+                        render_pass.clone(),
+                        &mut dynamic_state,
+                    );
+                    recreate_swapchain = false;
+                }
+
+                let (image_num, suboptimal, acquire_future) =
+                    match vulkano::swapchain::acquire_next_image(swapchain.clone(), None) {
+                        Ok(r) => r,
+                        Err(AcquireError::OutOfDate) => {
+                            recreate_swapchain = true;
+                            return;
+                        }
+                        Err(e) => panic!("Failed to acquire next image: {:?}", e),
+                    };
+
+                if suboptimal {
+                    recreate_swapchain = true;
+                }
+
+                let clear_values = vec![[0.0, 0.0, 1.0, 1.0].into()];
+
+                let mut builder = vulkano::command_buffer::AutoCommandBufferBuilder::primary(
+                    device.clone(),
+                    queue.family(),
+                    CommandBufferUsage::OneTimeSubmit
+                ).unwrap();
+
+
+                let x = builder
+                    .begin_render_pass(framebuffers[image_num].clone(), SubpassContents::Inline, clear_values)
+                    .unwrap()
+                    .draw(pipeline.clone(), &dynamic_state, vertex_buffer.clone(), (), (), vec![])
+                    .unwrap()
+                    .end_render_pass()
+                    .unwrap();
+
+                let command_buffer = builder.build().unwrap();
+
+                let future = previous_frame_end
+                    .take()
+                    .unwrap()
+                    .join(acquire_future)
+                    .then_execute(queue.clone(), command_buffer)
+                    .unwrap()
+                    .then_swapchain_present(queue.clone(), swapchain.clone(), image_num)
+                    .then_signal_fence_and_flush();
+
+                match future {
+                    Ok(future) => {
+                        previous_frame_end = Some(future.boxed());
+                    }
+                    Err(FlushError::OutOfDate) => {
+                        recreate_swapchain = true;
+                        previous_frame_end = Some(sync::now(device.clone()).boxed())
+                    }
+                    Err(e) => {
+                        println!("Failed to flush future: {:?}", e);
+                        previous_frame_end = Some(sync::now(device.clone()).boxed());
+                    }
+                }
             }
             _ => ()
         }
